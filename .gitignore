@@ -1,0 +1,29 @@
+# Anchor / Solana
+.anchor
+target/
+test-ledger/
+
+# Node
+node_modules/
+dist/
+.next/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# SQLite
+*.db
+*.db-journal
+
+# Build artifacts
+*.so

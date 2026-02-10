@@ -1,0 +1,16 @@
+[features]
+seeds = false
+skip-lint = false
+
+[programs.localnet]
+worth_hub = "8qXNZGRTwYeAw3fdPsaqJ3cq5ieyZWtxrXTZizmuZFeQ"
+
+[registry]
+url = "https://api.apr.dev"
+
+[provider]
+cluster = "Localnet"
+wallet = "~/.config/solana/id.json"
+
+[scripts]
+test = "npx mocha --require tsx --timeout 1000000 tests/**/*.ts"

@@ -1,0 +1,35 @@
+{
+  "name": "poworth",
+  "version": "0.1.0",
+  "description": "Proof of Worth - A commit-reveal prediction market on Solana",
+  "private": true,
+  "scripts": {
+    "test": "anchor test",
+    "build": "anchor build",
+    "deploy": "anchor deploy",
+    "demo": "npx ts-node scripts/run-agents.ts",
+    "oracle": "npx ts-node scripts/run-oracle.ts"
+  },
+  "dependencies": {
+    "@coral-xyz/anchor": "^0.31.1",
+    "@solana/spl-token": "^0.4.8",
+    "@solana/web3.js": "^1.95.3",
+    "bs58": "^6.0.0",
+    "dotenv": "^16.4.5",
+    "js-sha3": "^0.9.3",
+    "openai": "^4.67.1",
+    "yahoo-finance2": "^2.12.4"
+  },
+  "devDependencies": {
+    "@types/bn.js": "^5.1.5",
+    "@types/chai": "^4.3.19",
+    "@types/mocha": "^10.0.8",
+    "@types/node": "^22.7.4",
+    "chai": "^4.5.0",
+    "mocha": "^10.7.3",
+    "ts-mocha": "^10.0.0",
+    "ts-node": "^10.9.2",
+    "tsx": "^4.21.0",
+    "typescript": "^5.6.2"
+  }
+}
