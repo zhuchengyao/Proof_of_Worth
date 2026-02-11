@@ -6,6 +6,9 @@ use crate::state::{Commitment, Topic, TopicStatus};
 /// Fixed-point precision: 1e6
 const PRECISION: u128 = 1_000_000;
 
+/// Maximum percentage deviation (100x = 10000%) to prevent overflow
+const MAX_PCT: i128 = 100_000_000; // PRECISION * 100
+
 /// Precomputed ln(N + e) * PRECISION values for N = 0..63
 /// ln(0 + e) = 1.0, ln(1 + e) ≈ 1.313, ln(2 + e) ≈ 1.547, ...
 /// These are scaled by PRECISION (1e6)
@@ -117,6 +120,27 @@ pub struct SettleTopic<'info> {
     // passed via ctx.remaining_accounts
 }
 
+/// Consensus-Deviation-Weighted Reward Formula
+///
+/// Instead of rewarding pure accuracy, this formula rewards predictions that
+/// deviate from the consensus in the correct direction. Bold, contrarian
+/// predictions that turn out to be right earn significantly more.
+///
+/// Algorithm:
+///   1. Compute stake-weighted consensus: μ = Σ(pred_i × stake_i) / Σ(stake_i)
+///   2. For each participant:
+///      - edge_pct  = (pred_i − μ) × PRECISION / |μ|    (% deviation from consensus)
+///      - truth_pct = (truth − μ) × PRECISION / |μ|     (% truth deviation from consensus)
+///      - alignment = edge_pct × truth_pct               (positive ⟹ correct direction)
+///   3. Score = max(0, alignment) × accuracy × time_decay
+///      where accuracy  = PRECISION² / (|truth − pred| + 1)
+///            time_decay = PRECISION² / ln(N + e)
+///   4. Payout = stake + loser_pool × score / Σ(scores)
+///
+/// Key properties:
+///   - Consensus predictors (edge ≈ 0) get near-zero bonus
+///   - Wrong-direction predictions (alignment < 0) get zero bonus
+///   - Bold + accurate predictions get the largest share
 pub fn handle_settle<'info>(ctx: Context<'_, '_, 'info, 'info, SettleTopic<'info>>) -> Result<()> {
     let topic = &ctx.accounts.topic;
     let truth = topic.truth_value;
@@ -129,17 +153,19 @@ pub fn handle_settle<'info>(ctx: Context<'_, '_, 'info, 'info, SettleTopic<'info
 
     let pair_count = remaining.len() / 2;
 
-    // First pass: compute scores for all revealed commitments
-    struct ParticipantScore {
+    // ── Phase 1: Deserialize all commitments and compute consensus ──────
+
+    struct ParticipantData {
         commitment_index: usize,
         participant_index: usize,
         stake: u64,
-        score: u128,
+        prediction: i64,
+        submit_order: u32,
         revealed: bool,
     }
 
-    let mut scores: Vec<ParticipantScore> = Vec::with_capacity(pair_count);
-    let mut total_score: u128 = 0;
+    let mut participants: Vec<ParticipantData> = Vec::with_capacity(pair_count);
+    let mut consensus_num: i128 = 0; // Σ(prediction × stake)
     let mut total_revealed_stake: u64 = 0;
     let mut total_unrevealed_stake: u64 = 0;
 
@@ -147,51 +173,136 @@ pub fn handle_settle<'info>(ctx: Context<'_, '_, 'info, 'info, SettleTopic<'info
         let commitment_info = &remaining[i * 2];
         let data = commitment_info.try_borrow_data()?;
 
-        // Skip 8-byte discriminator
         let commitment: Commitment =
             Commitment::try_deserialize(&mut &data[..])
                 .map_err(|_| WorthHubError::NoRevealedCommitments)?;
 
         if commitment.revealed {
-            // W_e = PRECISION / (|truth - prediction| + 1)
-            let error = (truth - commitment.prediction_value).unsigned_abs() as u128;
-            let w_e = PRECISION * PRECISION / (error + 1);
-
-            // T_f = PRECISION / ln(N + e)
-            let ln_val = ln_approx(commitment.submit_order);
-            let t_f = PRECISION * PRECISION / ln_val;
-
-            // Score = W_e * T_f / PRECISION (to keep in PRECISION scale)
-            let score = w_e * t_f / PRECISION;
-
-            total_score = total_score
-                .checked_add(score)
+            consensus_num = consensus_num
+                .checked_add(
+                    (commitment.prediction_value as i128)
+                        .checked_mul(commitment.stake_amount as i128)
+                        .ok_or(WorthHubError::ArithmeticOverflow)?,
+                )
                 .ok_or(WorthHubError::ArithmeticOverflow)?;
             total_revealed_stake = total_revealed_stake
                 .checked_add(commitment.stake_amount)
                 .ok_or(WorthHubError::ArithmeticOverflow)?;
-
-            scores.push(ParticipantScore {
-                commitment_index: i * 2,
-                participant_index: i * 2 + 1,
-                stake: commitment.stake_amount,
-                score,
-                revealed: true,
-            });
         } else {
             total_unrevealed_stake = total_unrevealed_stake
                 .checked_add(commitment.stake_amount)
                 .ok_or(WorthHubError::ArithmeticOverflow)?;
+        }
 
-            scores.push(ParticipantScore {
-                commitment_index: i * 2,
-                participant_index: i * 2 + 1,
-                stake: commitment.stake_amount,
+        participants.push(ParticipantData {
+            commitment_index: i * 2,
+            participant_index: i * 2 + 1,
+            stake: commitment.stake_amount,
+            prediction: commitment.prediction_value,
+            submit_order: commitment.submit_order,
+            revealed: commitment.revealed,
+        });
+    }
+
+    // Stake-weighted consensus of revealed predictions
+    let consensus: i128 = if total_revealed_stake > 0 {
+        consensus_num / (total_revealed_stake as i128)
+    } else {
+        0
+    };
+
+    // ── Phase 2: Compute consensus-deviation-weighted scores ────────────
+
+    let truth_i128 = truth as i128;
+    let truth_edge: i128 = truth_i128 - consensus;
+
+    // Use |consensus| for percentage normalization (min 1 to avoid division by zero)
+    let abs_consensus: i128 = consensus.unsigned_abs().max(1) as i128;
+
+    // truth_edge as percentage of consensus (capped to prevent overflow)
+    let truth_edge_pct: i128 = (truth_edge
+        .checked_mul(PRECISION as i128)
+        .ok_or(WorthHubError::ArithmeticOverflow)?
+        / abs_consensus)
+        .max(-MAX_PCT)
+        .min(MAX_PCT);
+
+    struct ScoredParticipant {
+        commitment_index: usize,
+        participant_index: usize,
+        stake: u64,
+        score: u128,
+        revealed: bool,
+    }
+
+    let mut scored: Vec<ScoredParticipant> = Vec::with_capacity(pair_count);
+    let mut total_score: u128 = 0;
+
+    for p in &participants {
+        if p.revealed {
+            // Percentage deviation from consensus (capped)
+            let edge_i: i128 = (p.prediction as i128) - consensus;
+            let edge_pct: i128 = (edge_i
+                .checked_mul(PRECISION as i128)
+                .ok_or(WorthHubError::ArithmeticOverflow)?
+                / abs_consensus)
+                .max(-MAX_PCT)
+                .min(MAX_PCT);
+
+            // Alignment = edge_pct × truth_edge_pct
+            // Positive when prediction deviates from consensus in the SAME direction as truth
+            let alignment_i: i128 = edge_pct
+                .checked_mul(truth_edge_pct)
+                .ok_or(WorthHubError::ArithmeticOverflow)?;
+
+            let score: u128 = if alignment_i > 0 {
+                let alignment: u128 = alignment_i as u128;
+
+                // Accuracy weight: PRECISION² / (|truth − prediction| + 1)
+                let error = (truth_i128 - p.prediction as i128).unsigned_abs();
+                let w_e: u128 = PRECISION * PRECISION / (error + 1);
+
+                // Time decay: PRECISION² / ln(N + e)
+                let ln_val = ln_approx(p.submit_order);
+                let t_f: u128 = PRECISION * PRECISION / ln_val;
+
+                // score = alignment × w_e / PRECISION × t_f / PRECISION
+                let step1 = alignment
+                    .checked_mul(w_e)
+                    .ok_or(WorthHubError::ArithmeticOverflow)?
+                    / PRECISION;
+                step1
+                    .checked_mul(t_f)
+                    .ok_or(WorthHubError::ArithmeticOverflow)?
+                    / PRECISION
+            } else {
+                // Wrong direction or exactly on consensus → no bonus
+                0
+            };
+
+            total_score = total_score
+                .checked_add(score)
+                .ok_or(WorthHubError::ArithmeticOverflow)?;
+
+            scored.push(ScoredParticipant {
+                commitment_index: p.commitment_index,
+                participant_index: p.participant_index,
+                stake: p.stake,
+                score,
+                revealed: true,
+            });
+        } else {
+            scored.push(ScoredParticipant {
+                commitment_index: p.commitment_index,
+                participant_index: p.participant_index,
+                stake: p.stake,
                 score: 0,
                 revealed: false,
             });
         }
     }
+
+    // ── Phase 3: Distribute rewards ─────────────────────────────────────
 
     // The "loser pool" is the unrevealed stakes (people who didn't reveal forfeit)
     let loser_pool = total_unrevealed_stake as u128;
@@ -202,20 +313,21 @@ pub fn handle_settle<'info>(ctx: Context<'_, '_, 'info, 'info, SettleTopic<'info
     let rent_exempt_min = rent.minimum_balance(0);
 
     // Calculate all payouts first
-    let mut payouts: Vec<u64> = Vec::with_capacity(scores.len());
+    let mut payouts: Vec<u64> = Vec::with_capacity(scored.len());
     let mut total_payout: u64 = 0;
 
-    for ps in &scores {
-        let payout: u64 = if ps.revealed && total_score > 0 {
+    for sp in &scored {
+        let payout: u64 = if sp.revealed && total_score > 0 {
             let bonus = loser_pool
-                .checked_mul(ps.score)
+                .checked_mul(sp.score)
                 .ok_or(WorthHubError::ArithmeticOverflow)?
                 / total_score;
-            ps.stake
+            sp.stake
                 .checked_add(bonus as u64)
                 .ok_or(WorthHubError::ArithmeticOverflow)?
-        } else if ps.revealed {
-            ps.stake
+        } else if sp.revealed {
+            // Revealed but total_score is 0 (e.g. truth == consensus) → return stake
+            sp.stake
         } else {
             0
         };
@@ -238,9 +350,9 @@ pub fn handle_settle<'info>(ctx: Context<'_, '_, 'info, 'info, SettleTopic<'info
     let vault_balance = vault_info.lamports();
     let max_distributable = vault_balance.saturating_sub(rent_exempt_min);
 
-    for (i, ps) in scores.iter().enumerate() {
-        let participant_info = &remaining[ps.participant_index];
-        let commitment_info = &remaining[ps.commitment_index];
+    for (i, sp) in scored.iter().enumerate() {
+        let participant_info = &remaining[sp.participant_index];
+        let commitment_info = &remaining[sp.commitment_index];
 
         let mut payout = payouts[i];
 
@@ -299,10 +411,11 @@ pub fn handle_settle<'info>(ctx: Context<'_, '_, 'info, 'info, SettleTopic<'info
     topic.status = TopicStatus::Settled;
 
     msg!(
-        "Topic settled: id={}, truth={}, participants={}, loser_pool={}",
+        "Topic settled: id={}, truth={}, consensus={}, participants={}, loser_pool={}",
         topic.topic_id,
         truth,
-        scores.len(),
+        consensus,
+        scored.len(),
         loser_pool
     );
 

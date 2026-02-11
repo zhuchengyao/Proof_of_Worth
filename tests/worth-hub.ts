@@ -517,12 +517,17 @@ describe("WorthHub", () => {
       console.log(`    Agent2 (pred $155.50, truth $151.00): gain = ${gain2 / LAMPORTS_PER_SOL} SOL`);
       console.log(`    Agent3 (no reveal, forfeited):        gain = ${gain3 / LAMPORTS_PER_SOL} SOL`);
 
-      // Agent1 predicted closer to truth ($150 vs $151 = $1 error)
-      // Agent2 predicted further ($155.50 vs $151 = $4.50 error)
-      // Agent1 was also first (submit_order=0), so gets time bonus
-      // Agent3 didn't reveal, so forfeits stake
+      // Consensus-Deviation-Weighted Reward Formula:
+      //   consensus = ($150 × 0.1 + $155.50 × 0.1) / 0.2 = $152.75
+      //   truth_edge = $151 - $152.75 = -$1.75 (truth is BELOW consensus)
+      //
+      //   Agent1: edge = $150 - $152.75 = -$2.75 (predicted below consensus → SAME direction as truth)
+      //           alignment > 0 → gets bonus from loser pool
+      //   Agent2: edge = $155.50 - $152.75 = +$2.75 (predicted above consensus → WRONG direction)
+      //           alignment < 0 → score = 0, only gets stake back
+      //   Agent3: didn't reveal → forfeits stake entirely
 
-      // Agent1 should get more than Agent2
+      // Agent1 should get more than Agent2 (Agent1 has positive alignment, Agent2 has zero)
       expect(gain1).to.be.greaterThan(gain2);
 
       // Agent3 should get nothing (forfeited)
